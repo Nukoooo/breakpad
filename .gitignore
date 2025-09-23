@@ -30,6 +30,9 @@
 .repo/
 .svn/
 
+
+build/
+
 # Ignore common compiled artifacts.
 *~
 *.dwo

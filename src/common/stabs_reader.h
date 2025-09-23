@@ -52,6 +52,8 @@
 #ifdef HAVE_MACH_O_NLIST_H
 #include <mach-o/nlist.h>
 #elif defined(HAVE_A_OUT_H)
+#include <linux/a.out.h>
+#elif defined(HAVE_A_OUT_H_EX)
 #include <a.out.h>
 #endif
 
