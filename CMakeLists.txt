@@ -35,6 +35,7 @@ add_library(libdisasm STATIC ${libdisasm_SOURCES})
 add_library(libdisasm::libdisasm ALIAS libdisasm)
 
 target_compile_definitions(libdisasm PRIVATE HAVE_CONFIG_H)
+target_compile_options(libdisasm PRIVATE -fPIC)
 
 target_include_directories(libdisasm PUBLIC
     ${LIBDISASM_DIR}
@@ -147,6 +148,7 @@ add_library(breakpad STATIC)
 add_library(breakpad::breakpad ALIAS breakpad)
 target_compile_definitions(breakpad PRIVATE HAVE_CONFIG_H _GLIBCXX_USE_CXX11_ABI=0)
 target_compile_features(breakpad PRIVATE cxx_std_17)
+target_compile_options(breakpad PRIVATE -fPIC)
 target_link_libraries(breakpad PRIVATE
     libdisasm::libdisasm
 )
