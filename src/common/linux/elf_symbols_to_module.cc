@@ -164,19 +164,28 @@ bool ELFSymbolsToModule(const uint8_t* symtab_section,
   while(!iterator->at_end) {
     if (ELF32_ST_TYPE(iterator->info) == STT_FUNC &&
         iterator->shndx != SHN_UNDEF) {
-      auto ext = std::make_unique<Module::Extern>(iterator->value);
-      ext->name = SymbolString(iterator->name_offset, strings);
+      std::string name = SymbolString(iterator->name_offset, strings);
 #if !defined(__ANDROID__)  // Android NDK doesn't provide abi::__cxa_demangle.
       int status = 0;
       char* demangled =
-          abi::__cxa_demangle(ext->name.c_str(), nullptr, nullptr, &status);
+          abi::__cxa_demangle(name.c_str(), nullptr, nullptr, &status);
       if (demangled) {
         if (status == 0)
-          ext->name = demangled;
+          name = demangled;
         free(demangled);
       }
 #endif
-      module->AddExtern(std::move(ext));
+#if 1
+      if (iterator->size) {
+        Module::Function *fun = new Module::Function(module->AddStringToPool(name), iterator->value);
+        fun->ranges.push_back(Module::Range(iterator->value, iterator->size));
+        module->AddFunction(fun);
+      }
+#else
+      Module::Extern *ext = new Module::Extern(iterator->value);
+      ext->name = name;
+       module->AddExtern(std::move(ext));
+#endif
     }
     ++iterator;
   }

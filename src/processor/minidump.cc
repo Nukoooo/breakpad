@@ -3198,7 +3198,7 @@ bool MinidumpModuleList::Read(uint32_t expected_size) {
         BPLOG(ERROR) << "MinidumpModuleList could not read required module "
                         "auxiliary data for module " <<
                         module_index << "/" << module_count;
-        return false;
+        continue;
       }
 
       // It is safe to use module->code_file() after successfully calling
@@ -3210,7 +3210,14 @@ bool MinidumpModuleList::Read(uint32_t expected_size) {
         BPLOG(ERROR) << "MinidumpModuleList found bad base address for module "
                      << module_index << "/" << module_count << ", "
                      << module.code_file();
-        return false;
+        continue;
+      }
+      
+      if (module_size == static_cast<uint32_t>(-1)) {
+        BPLOG(ERROR) << "MinidumpModuleList found bad size for module "
+                     << module_index << "/" << module_count << ", "
+                     << module.code_file();
+        continue;
       }
 
       // Some minidumps have additional modules in the list that are duplicates.
@@ -3237,7 +3244,7 @@ bool MinidumpModuleList::Read(uint32_t expected_size) {
                        << module_index << "/" << module_count << ", "
                        << module.code_file() << ", " << HexString(base_address)
                        << "+" << HexString(module_size);
-          return false;
+          continue;
         }
 
         // If failed due to apparent range overlap the cause may be the client
