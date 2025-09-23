@@ -41,8 +41,17 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <elf.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <algorithm>  // For std::sort and std::lower_bound
+#include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
+#include <cxxabi.h>
 
 #include "common/stdio_wrapper.h"
 #include "google_breakpad/processor/call_stack.h"
@@ -58,8 +67,8 @@ namespace google_breakpad {
 
 namespace {
 
-using std::vector;
 using std::unique_ptr;
+using std::vector;
 
 // Separator character for machine readable output.
 static const char kOutputSeparator = '|';
@@ -88,7 +97,7 @@ static int PrintRegister(const char* name, uint32_t value, int start_col) {
 // PrintRegister64 does the same thing, but for 64-bit registers.
 static int PrintRegister64(const char* name, uint64_t value, int start_col) {
   char buffer[64];
-  snprintf(buffer, sizeof(buffer), " %5s = 0x%016" PRIx64 , name, value);
+  snprintf(buffer, sizeof(buffer), " %5s = 0x%016" PRIx64, name, value);
 
   if (start_col + static_cast<ssize_t>(strlen(buffer)) > kMaxWidth) {
     start_col = 0;
@@ -153,8 +162,7 @@ static void PrintStackContents(const std::string& indent,
     const StackFrameARM* frame_arm = static_cast<const StackFrameARM*>(frame);
     const StackFrameARM* prev_frame_arm =
         static_cast<const StackFrameARM*>(prev_frame);
-    if ((frame_arm->context_validity &
-         StackFrameARM::CONTEXT_VALID_SP) &&
+    if ((frame_arm->context_validity & StackFrameARM::CONTEXT_VALID_SP) &&
         (prev_frame_arm->context_validity & StackFrameARM::CONTEXT_VALID_SP)) {
       stack_begin = frame_arm->context.iregs[13];
       stack_end = prev_frame_arm->context.iregs[13];
@@ -165,8 +173,7 @@ static void PrintStackContents(const std::string& indent,
         static_cast<const StackFrameARM64*>(frame);
     const StackFrameARM64* prev_frame_arm64 =
         static_cast<const StackFrameARM64*>(prev_frame);
-    if ((frame_arm64->context_validity &
-         StackFrameARM64::CONTEXT_VALID_SP) &&
+    if ((frame_arm64->context_validity & StackFrameARM64::CONTEXT_VALID_SP) &&
         (prev_frame_arm64->context_validity &
          StackFrameARM64::CONTEXT_VALID_SP)) {
       stack_begin = frame_arm64->context.iregs[31];
@@ -178,8 +185,7 @@ static void PrintStackContents(const std::string& indent,
         static_cast<const StackFrameRISCV*>(frame);
     const StackFrameRISCV* prev_frame_riscv =
         static_cast<const StackFrameRISCV*>(prev_frame);
-    if ((frame_riscv->context_validity &
-         StackFrameRISCV::CONTEXT_VALID_SP) &&
+    if ((frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_SP) &&
         (prev_frame_riscv->context_validity &
          StackFrameRISCV::CONTEXT_VALID_SP)) {
       stack_begin = frame_riscv->context.sp;
@@ -204,7 +210,7 @@ static void PrintStackContents(const std::string& indent,
 
   // Print stack contents.
   printf("\n%sStack contents:", indent.c_str());
-  for(uint64_t address = stack_begin; address < stack_end; ) {
+  for (uint64_t address = stack_begin; address < stack_end;) {
     // Print the start address of this row.
     if (word_length == 4)
       printf("\n%s %08x", indent.c_str(), static_cast<uint32_t>(address));
@@ -216,8 +222,7 @@ static void PrintStackContents(const std::string& indent,
     std::string data_as_string;
     for (int i = 0; i < kBytesPerRow; ++i, ++address) {
       uint8_t value = 0;
-      if (address < stack_end &&
-          memory->GetMemoryAtAddress(address, &value)) {
+      if (address < stack_end && memory->GetMemoryAtAddress(address, &value)) {
         printf(" %02x", value);
         data_as_string.push_back(isprint(value) ? value : '.');
       } else {
@@ -271,11 +276,243 @@ static void PrintStackContents(const std::string& indent,
       }
     };
     print_function_name(&pointee_frame);
-    for (unique_ptr<StackFrame> &frame : inlined_frames)
+    for (unique_ptr<StackFrame>& frame : inlined_frames)
       print_function_name(frame.get());
   }
   printf("\n");
 }
+
+struct Symbol {
+  std::string name;
+  uint64_t address;
+  uint64_t size;
+  std::string type;
+  std::string binding;
+  std::string section;
+};
+
+static const char* GetSymbolType(uint8_t type) {
+  switch (type) {
+    case STT_NOTYPE:
+      return "NOTYPE";
+    case STT_OBJECT:
+      return "OBJECT";
+    case STT_FUNC:
+      return "FUNC";
+    case STT_SECTION:
+      return "SECTION";
+    case STT_FILE:
+      return "FILE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static const char* GetSymbolBinding(uint8_t binding) {
+  switch (binding) {
+    case STB_LOCAL:
+      return "LOCAL";
+    case STB_GLOBAL:
+      return "GLOBAL";
+    case STB_WEAK:
+      return "WEAK";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static std::string DemangleSymbol(const char* mangled_symbol) {
+    int status = 0;
+
+    char* demangled_name_c = abi::__cxa_demangle(mangled_symbol, nullptr, nullptr, &status);
+
+    if (status == 0 && demangled_name_c) {
+        // Success! Use a unique_ptr with a custom deleter (std::free)
+        // to ensure the malloc'd memory is freed automatically.
+        std::unique_ptr<char, decltype(&std::free)> demangled_ptr(demangled_name_c, &std::free);
+        return std::string(demangled_ptr.get());
+    } else {
+        return std::string(mangled_symbol);
+    }
+}
+
+
+class ElfSymbolParser {
+ public:
+  ElfSymbolParser() { Cleanup(); }
+  ~ElfSymbolParser() { Cleanup(); }
+
+  bool Load(const std::string& file_path) {
+    Cleanup();
+
+    fd_ = open(file_path.c_str(), O_RDONLY);
+    if (fd_ == -1) {
+      perror("open");
+      return false;
+    }
+
+    struct stat file_stat;
+    if (fstat(fd_, &file_stat) == -1) {
+      perror("fstat");
+      Cleanup();
+      return false;
+    }
+    file_size_ = file_stat.st_size;
+
+    map_start_ = mmap(nullptr, file_size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+    if (map_start_ == MAP_FAILED) {
+      perror("mmap");
+      Cleanup();
+      return false;
+    }
+
+    ehdr_ = (Elf64_Ehdr*)map_start_;
+
+    if (memcmp(ehdr_->e_ident, ELFMAG, SELFMAG) != 0 ||
+        ehdr_->e_ident[EI_CLASS] != ELFCLASS64) {
+      std::cerr << "Error: Not a valid 64-bit ELF file." << std::endl;
+      Cleanup();
+      return false;
+    }
+
+    shdr_table_ = (Elf64_Shdr*)((char*)map_start_ + ehdr_->e_shoff);
+    shstrtab_ = (const char*)((char*)map_start_ +
+                              shdr_table_[ehdr_->e_shstrndx].sh_offset);
+
+    Elf64_Shdr *dynsym_shdr = nullptr, *dynstr_shdr = nullptr;
+    Elf64_Shdr *symtab_shdr = nullptr, *strtab_shdr = nullptr;
+
+    for (int i = 0; i < ehdr_->e_shnum; ++i) {
+      const char* name = &shstrtab_[shdr_table_[i].sh_name];
+      if (strcmp(name, ".dynsym") == 0)
+        dynsym_shdr = &shdr_table_[i];
+      if (strcmp(name, ".dynstr") == 0)
+        dynstr_shdr = &shdr_table_[i];
+      if (strcmp(name, ".symtab") == 0)
+        symtab_shdr = &shdr_table_[i];
+      if (strcmp(name, ".strtab") == 0)
+        strtab_shdr = &shdr_table_[i];
+    }
+
+    if (dynsym_shdr && dynstr_shdr) {
+      ParseSymbolTable(dynsym_shdr, dynstr_shdr);
+    }
+    if (symtab_shdr && strtab_shdr) {
+      ParseSymbolTable(symtab_shdr, strtab_shdr);
+    }
+
+    // Sort symbols by address for efficient lookup
+    std::sort(
+        symbols_.begin(), symbols_.end(),
+        [](const Symbol& a, const Symbol& b) { return a.address < b.address; });
+
+    return true;
+  }
+
+  // Get all the parsed symbols.
+  const std::vector<Symbol>& GetSymbols() const { return symbols_; }
+
+  // Find the symbol that contains a given address.
+  std::optional<Symbol> FindSymbolByAddress(uint64_t address) const {
+    auto comparator = [](const Symbol& sym, uint64_t addr) {
+      return sym.address < addr;
+    };
+
+    auto it =
+        std::lower_bound(symbols_.begin(), symbols_.end(), address, comparator);
+
+    // If it's the beginning, it can't be our symbol (we need the one *before*
+    // it)
+    if (it == symbols_.begin()) {
+      return std::nullopt;
+    }
+
+    // lower_bound gives us the first element >= address. We want the last
+    // element <= address. So we step back one iterator.
+    const Symbol& candidate = *(--it);
+
+    // Check if the address falls within the range of the candidate symbol
+    if (address >= candidate.address &&
+        address < (candidate.address + candidate.size)) {
+      return candidate;
+    }
+
+    return std::nullopt;
+  }
+
+ private:
+  void Cleanup() {
+    if (map_start_) {
+      munmap(map_start_, file_size_);
+      map_start_ = nullptr;
+    }
+    if (fd_ != -1) {
+      close(fd_);
+      fd_ = -1;
+    }
+    symbols_.clear();
+  }
+
+  void ParseSymbolTable(Elf64_Shdr* symtab_shdr, Elf64_Shdr* strtab_shdr) {
+    Elf64_Sym* sym_table =
+        (Elf64_Sym*)((char*)map_start_ + symtab_shdr->sh_offset);
+    const char* str_table =
+        (const char*)((char*)map_start_ + strtab_shdr->sh_offset);
+    int num_symbols = symtab_shdr->sh_size / symtab_shdr->sh_entsize;
+
+    for (int i = 0; i < num_symbols; ++i) {
+      Elf64_Sym& elf_sym = sym_table[i];
+
+      // We only care about symbols with a name and an address (value).
+      // Functions and Objects are the most interesting.
+      uint8_t type = ELF64_ST_TYPE(elf_sym.st_info);
+      if (elf_sym.st_name == 0 || elf_sym.st_value == 0 ||
+          (type != STT_FUNC && type != STT_OBJECT)) {
+        continue;
+      }
+
+      Symbol& s = symbols_.emplace_back();
+      s.name = &str_table[elf_sym.st_name];
+      s.address = elf_sym.st_value;
+      s.size = elf_sym.st_size;
+      s.type = GetSymbolType(type);
+      s.binding = GetSymbolBinding(ELF64_ST_BIND(elf_sym.st_info));
+      s.section = GetSectionName(elf_sym.st_shndx);
+    }
+  }
+
+  // Helper to get section name from its index
+  const char* GetSectionName(uint16_t shndx) {
+    if (shndx >= ehdr_->e_shnum) {
+      // Special section indices
+      switch (shndx) {
+        case SHN_ABS:
+          return "ABS";
+        case SHN_COMMON:
+          return "COMMON";
+        case SHN_UNDEF:
+          return "UNDEF";
+        default:
+          return "INVALID_SECTION";
+      }
+    }
+    return &shstrtab_[shdr_table_[shndx].sh_name];
+  }
+
+  // Member variables
+  int fd_ = -1;
+  void* map_start_ = nullptr;
+  size_t file_size_ = 0;
+
+  Elf64_Ehdr* ehdr_ = nullptr;
+  Elf64_Shdr* shdr_table_ = nullptr;
+  const char* shstrtab_ = nullptr;
+
+  std::vector<Symbol> symbols_;
+};
+
+static std::unordered_map<std::string, std::unique_ptr<ElfSymbolParser>>
+    g_symbolMaps{};
 
 static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
   printf("%2d  ", frame_index);
@@ -283,7 +520,22 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
   uint64_t instruction_address = frame->ReturnAddress();
 
   if (frame->module) {
+    auto path = frame->module->code_file();
+    ElfSymbolParser* parser = nullptr;
+    if (auto it = g_symbolMaps.find(path); it != g_symbolMaps.end()) {
+      parser = it->second.get();
+    } else {
+      auto ptr = std::make_unique<ElfSymbolParser>();
+      if (!ptr->Load(path)) {
+        std::cout << "Failed to load" << path << " for ElfSymbolParser\n";
+        return;
+      }
+
+      g_symbolMaps[path] = std::move(ptr);
+      parser = g_symbolMaps[path].get();
+    }
     printf("%s", PathnameStripper::File(frame->module->code_file()).c_str());
+
     if (!frame->function_name.empty()) {
       printf("!%s", frame->function_name.c_str());
       if (!frame->source_file_name.empty()) {
@@ -294,6 +546,20 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
                instruction_address - frame->source_line_base);
       } else {
         printf(" + 0x%" PRIx64, instruction_address - frame->function_base);
+      }
+    } else if (parser != nullptr) {
+      uint64_t rva = instruction_address - frame->module->base_address();
+
+      printf(" + 0x%" PRIx64, rva);
+
+      auto symbol = parser->FindSymbolByAddress(rva);
+      if (symbol.has_value()) {
+        auto& value = symbol.value();
+        // The symbol's address (value.address) is also an RVA
+        uint64_t offset_in_symbol = rva - value.address;
+
+        // printf(" (%s + 0x%" PRIx64 ")", DemangleSymbol(value.name.c_str()).c_str(), offset_in_symbol);
+        printf(" (%s + 0x%" PRIx64 ")", value.name.c_str(), offset_in_symbol);
       }
     } else {
       printf(" + 0x%" PRIx64,
@@ -313,8 +579,10 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
 //
 // If |cpu| is a recognized CPU name, relevant register state for each stack
 // frame printed is also output, if available.
-static void PrintStack(const CallStack* stack, const std::string& cpu,
-                       bool output_stack_contents, const MemoryRegion* memory,
+static void PrintStack(const CallStack* stack,
+                       const std::string& cpu,
+                       bool output_stack_contents,
+                       const MemoryRegion* memory,
                        const CodeModules* modules,
                        SourceLineResolverInterface* resolver) {
   int frame_count = stack->frames()->size();
@@ -674,266 +942,172 @@ static void PrintStack(const CallStack* stack, const std::string& cpu,
         const StackFrameRISCV* frame_riscv =
             reinterpret_cast<const StackFrameRISCV*>(frame);
 
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_PC)
-          sequence = PrintRegister(
-              "pc", frame_riscv->context.pc, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_RA)
-          sequence = PrintRegister(
-              "ra", frame_riscv->context.ra, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_SP)
-          sequence = PrintRegister(
-              "sp", frame_riscv->context.sp, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_GP)
-          sequence = PrintRegister(
-              "gp", frame_riscv->context.gp, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_TP)
-          sequence = PrintRegister(
-              "tp", frame_riscv->context.tp, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T0)
-          sequence = PrintRegister(
-              "t0", frame_riscv->context.t0, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T1)
-          sequence = PrintRegister(
-              "t1", frame_riscv->context.t1, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T2)
-          sequence = PrintRegister(
-              "t2", frame_riscv->context.t2, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S0)
-          sequence = PrintRegister(
-              "s0", frame_riscv->context.s0, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S1)
-          sequence = PrintRegister(
-              "s1", frame_riscv->context.s1, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A0)
-          sequence = PrintRegister(
-              "a0", frame_riscv->context.a0, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A1)
-          sequence = PrintRegister(
-              "a1", frame_riscv->context.a1, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A2)
-          sequence = PrintRegister(
-              "a2", frame_riscv->context.a2, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A3)
-          sequence = PrintRegister(
-              "a3", frame_riscv->context.a3, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A4)
-          sequence = PrintRegister(
-              "a4", frame_riscv->context.a4, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A5)
-          sequence = PrintRegister(
-              "a5", frame_riscv->context.a5, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A6)
-          sequence = PrintRegister(
-              "a6", frame_riscv->context.a6, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_A7)
-          sequence = PrintRegister(
-              "a7", frame_riscv->context.a7, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S2)
-          sequence = PrintRegister(
-              "s2", frame_riscv->context.s2, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S3)
-          sequence = PrintRegister(
-              "s3", frame_riscv->context.s3, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S4)
-          sequence = PrintRegister(
-              "s4", frame_riscv->context.s4, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S5)
-          sequence = PrintRegister(
-              "s5", frame_riscv->context.s5, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S6)
-          sequence = PrintRegister(
-              "s6", frame_riscv->context.s6, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S7)
-          sequence = PrintRegister(
-              "s7", frame_riscv->context.s7, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S8)
-          sequence = PrintRegister(
-              "s8", frame_riscv->context.s8, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S9)
-          sequence = PrintRegister(
-              "s9", frame_riscv->context.s9, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S10)
-          sequence = PrintRegister(
-              "s10", frame_riscv->context.s10, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_S11)
-          sequence = PrintRegister(
-              "s11", frame_riscv->context.s11, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T3)
-          sequence = PrintRegister(
-              "t3", frame_riscv->context.t3, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T4)
-          sequence = PrintRegister(
-              "t4", frame_riscv->context.t4, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T5)
-          sequence = PrintRegister(
-              "t5", frame_riscv->context.t5, sequence);
-        if (frame_riscv->context_validity &
-            StackFrameRISCV::CONTEXT_VALID_T6)
-          sequence = PrintRegister(
-              "t6", frame_riscv->context.t6, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_PC)
+          sequence = PrintRegister("pc", frame_riscv->context.pc, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_RA)
+          sequence = PrintRegister("ra", frame_riscv->context.ra, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_SP)
+          sequence = PrintRegister("sp", frame_riscv->context.sp, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_GP)
+          sequence = PrintRegister("gp", frame_riscv->context.gp, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_TP)
+          sequence = PrintRegister("tp", frame_riscv->context.tp, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T0)
+          sequence = PrintRegister("t0", frame_riscv->context.t0, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T1)
+          sequence = PrintRegister("t1", frame_riscv->context.t1, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T2)
+          sequence = PrintRegister("t2", frame_riscv->context.t2, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S0)
+          sequence = PrintRegister("s0", frame_riscv->context.s0, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S1)
+          sequence = PrintRegister("s1", frame_riscv->context.s1, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A0)
+          sequence = PrintRegister("a0", frame_riscv->context.a0, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A1)
+          sequence = PrintRegister("a1", frame_riscv->context.a1, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A2)
+          sequence = PrintRegister("a2", frame_riscv->context.a2, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A3)
+          sequence = PrintRegister("a3", frame_riscv->context.a3, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A4)
+          sequence = PrintRegister("a4", frame_riscv->context.a4, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A5)
+          sequence = PrintRegister("a5", frame_riscv->context.a5, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A6)
+          sequence = PrintRegister("a6", frame_riscv->context.a6, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_A7)
+          sequence = PrintRegister("a7", frame_riscv->context.a7, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S2)
+          sequence = PrintRegister("s2", frame_riscv->context.s2, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S3)
+          sequence = PrintRegister("s3", frame_riscv->context.s3, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S4)
+          sequence = PrintRegister("s4", frame_riscv->context.s4, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S5)
+          sequence = PrintRegister("s5", frame_riscv->context.s5, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S6)
+          sequence = PrintRegister("s6", frame_riscv->context.s6, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S7)
+          sequence = PrintRegister("s7", frame_riscv->context.s7, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S8)
+          sequence = PrintRegister("s8", frame_riscv->context.s8, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S9)
+          sequence = PrintRegister("s9", frame_riscv->context.s9, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S10)
+          sequence = PrintRegister("s10", frame_riscv->context.s10, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_S11)
+          sequence = PrintRegister("s11", frame_riscv->context.s11, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T3)
+          sequence = PrintRegister("t3", frame_riscv->context.t3, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T4)
+          sequence = PrintRegister("t4", frame_riscv->context.t4, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T5)
+          sequence = PrintRegister("t5", frame_riscv->context.t5, sequence);
+        if (frame_riscv->context_validity & StackFrameRISCV::CONTEXT_VALID_T6)
+          sequence = PrintRegister("t6", frame_riscv->context.t6, sequence);
       } else if (cpu == "riscv64") {
         const StackFrameRISCV64* frame_riscv64 =
             reinterpret_cast<const StackFrameRISCV64*>(frame);
 
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_PC)
-          sequence = PrintRegister64(
-              "pc", frame_riscv64->context.pc, sequence);
+          sequence = PrintRegister64("pc", frame_riscv64->context.pc, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_RA)
-          sequence = PrintRegister64(
-              "ra", frame_riscv64->context.ra, sequence);
+          sequence = PrintRegister64("ra", frame_riscv64->context.ra, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_SP)
-          sequence = PrintRegister64(
-              "sp", frame_riscv64->context.sp, sequence);
+          sequence = PrintRegister64("sp", frame_riscv64->context.sp, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_GP)
-          sequence = PrintRegister64(
-              "gp", frame_riscv64->context.gp, sequence);
+          sequence = PrintRegister64("gp", frame_riscv64->context.gp, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_TP)
-          sequence = PrintRegister64(
-              "tp", frame_riscv64->context.tp, sequence);
+          sequence = PrintRegister64("tp", frame_riscv64->context.tp, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T0)
-          sequence = PrintRegister64(
-              "t0", frame_riscv64->context.t0, sequence);
+          sequence = PrintRegister64("t0", frame_riscv64->context.t0, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T1)
-          sequence = PrintRegister64(
-              "t1", frame_riscv64->context.t1, sequence);
+          sequence = PrintRegister64("t1", frame_riscv64->context.t1, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T2)
-          sequence = PrintRegister64(
-              "t2", frame_riscv64->context.t2, sequence);
+          sequence = PrintRegister64("t2", frame_riscv64->context.t2, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S0)
-          sequence = PrintRegister64(
-              "s0", frame_riscv64->context.s0, sequence);
+          sequence = PrintRegister64("s0", frame_riscv64->context.s0, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S1)
-          sequence = PrintRegister64(
-              "s1", frame_riscv64->context.s1, sequence);
+          sequence = PrintRegister64("s1", frame_riscv64->context.s1, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A0)
-          sequence = PrintRegister64(
-              "a0", frame_riscv64->context.a0, sequence);
+          sequence = PrintRegister64("a0", frame_riscv64->context.a0, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A1)
-          sequence = PrintRegister64(
-              "a1", frame_riscv64->context.a1, sequence);
+          sequence = PrintRegister64("a1", frame_riscv64->context.a1, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A2)
-          sequence = PrintRegister64(
-              "a2", frame_riscv64->context.a2, sequence);
+          sequence = PrintRegister64("a2", frame_riscv64->context.a2, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A3)
-          sequence = PrintRegister64(
-              "a3", frame_riscv64->context.a3, sequence);
+          sequence = PrintRegister64("a3", frame_riscv64->context.a3, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A4)
-          sequence = PrintRegister64(
-              "a4", frame_riscv64->context.a4, sequence);
+          sequence = PrintRegister64("a4", frame_riscv64->context.a4, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A5)
-          sequence = PrintRegister64(
-              "a5", frame_riscv64->context.a5, sequence);
+          sequence = PrintRegister64("a5", frame_riscv64->context.a5, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A6)
-          sequence = PrintRegister64(
-              "a6", frame_riscv64->context.a6, sequence);
+          sequence = PrintRegister64("a6", frame_riscv64->context.a6, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_A7)
-          sequence = PrintRegister64(
-              "a7", frame_riscv64->context.a7, sequence);
+          sequence = PrintRegister64("a7", frame_riscv64->context.a7, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S2)
-          sequence = PrintRegister64(
-              "s2", frame_riscv64->context.s2, sequence);
+          sequence = PrintRegister64("s2", frame_riscv64->context.s2, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S3)
-          sequence = PrintRegister64(
-              "s3", frame_riscv64->context.s3, sequence);
+          sequence = PrintRegister64("s3", frame_riscv64->context.s3, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S4)
-          sequence = PrintRegister64(
-              "s4", frame_riscv64->context.s4, sequence);
+          sequence = PrintRegister64("s4", frame_riscv64->context.s4, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S5)
-          sequence = PrintRegister64(
-              "s5", frame_riscv64->context.s5, sequence);
+          sequence = PrintRegister64("s5", frame_riscv64->context.s5, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S6)
-          sequence = PrintRegister64(
-              "s6", frame_riscv64->context.s6, sequence);
+          sequence = PrintRegister64("s6", frame_riscv64->context.s6, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S7)
-          sequence = PrintRegister64(
-              "s7", frame_riscv64->context.s7, sequence);
+          sequence = PrintRegister64("s7", frame_riscv64->context.s7, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S8)
-          sequence = PrintRegister64(
-              "s8", frame_riscv64->context.s8, sequence);
+          sequence = PrintRegister64("s8", frame_riscv64->context.s8, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S9)
-          sequence = PrintRegister64(
-              "s9", frame_riscv64->context.s9, sequence);
+          sequence = PrintRegister64("s9", frame_riscv64->context.s9, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S10)
-          sequence = PrintRegister64(
-              "s10", frame_riscv64->context.s10, sequence);
+          sequence =
+              PrintRegister64("s10", frame_riscv64->context.s10, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_S11)
-          sequence = PrintRegister64(
-              "s11", frame_riscv64->context.s11, sequence);
+          sequence =
+              PrintRegister64("s11", frame_riscv64->context.s11, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T3)
-          sequence = PrintRegister64(
-              "t3", frame_riscv64->context.t3, sequence);
+          sequence = PrintRegister64("t3", frame_riscv64->context.t3, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T4)
-          sequence = PrintRegister64(
-              "t4", frame_riscv64->context.t4, sequence);
+          sequence = PrintRegister64("t4", frame_riscv64->context.t4, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T5)
-          sequence = PrintRegister64(
-              "t5", frame_riscv64->context.t5, sequence);
+          sequence = PrintRegister64("t5", frame_riscv64->context.t5, sequence);
         if (frame_riscv64->context_validity &
             StackFrameRISCV64::CONTEXT_VALID_T6)
-          sequence = PrintRegister64(
-              "t6", frame_riscv64->context.t6, sequence);
+          sequence = PrintRegister64("t6", frame_riscv64->context.t6, sequence);
       }
     }
     printf("\n    Found by: %s\n", frame->trust_description().c_str());
@@ -965,25 +1139,22 @@ static void PrintStackMachineReadable(int thread_num, const CallStack* stack) {
 
     if (frame->module) {
       assert(!frame->module->code_file().empty());
-      printf("%s", StripSeparator(PathnameStripper::File(
-                     frame->module->code_file())).c_str());
+      printf("%s",
+             StripSeparator(PathnameStripper::File(frame->module->code_file()))
+                 .c_str());
       if (!frame->function_name.empty()) {
         printf("%c%s", kOutputSeparator,
                StripSeparator(frame->function_name).c_str());
         if (!frame->source_file_name.empty()) {
-          printf("%c%s%c%d%c0x%" PRIx64,
-                 kOutputSeparator,
+          printf("%c%s%c%d%c0x%" PRIx64, kOutputSeparator,
                  StripSeparator(frame->source_file_name).c_str(),
-                 kOutputSeparator,
-                 frame->source_line,
-                 kOutputSeparator,
+                 kOutputSeparator, frame->source_line, kOutputSeparator,
                  instruction_address - frame->source_line_base);
         } else {
           printf("%c%c%c0x%" PRIx64,
                  kOutputSeparator,  // empty source file
                  kOutputSeparator,  // empty source line
-                 kOutputSeparator,
-                 instruction_address - frame->function_base);
+                 kOutputSeparator, instruction_address - frame->function_base);
         }
       } else {
         printf("%c%c%c%c0x%" PRIx64,
@@ -999,8 +1170,7 @@ static void PrintStackMachineReadable(int thread_num, const CallStack* stack) {
              kOutputSeparator,  // empty function name
              kOutputSeparator,  // empty source file
              kOutputSeparator,  // empty source line
-             kOutputSeparator,
-             instruction_address);
+             kOutputSeparator, instruction_address);
     }
     printf("\n");
   }
@@ -1008,9 +1178,8 @@ static void PrintStackMachineReadable(int thread_num, const CallStack* stack) {
 
 // ContainsModule checks whether a given |module| is in the vector
 // |modules_without_symbols|.
-static bool ContainsModule(
-    const vector<const CodeModule*>* modules,
-    const CodeModule* module) {
+static bool ContainsModule(const vector<const CodeModule*>* modules,
+                           const CodeModule* module) {
   assert(modules);
   assert(module);
   vector<const CodeModule*>::const_iterator iter;
@@ -1034,16 +1203,16 @@ static void PrintModule(
   std::string symbol_issues;
   if (ContainsModule(modules_without_symbols, module)) {
     symbol_issues = "  (WARNING: No symbols, " +
-        PathnameStripper::File(module->debug_file()) + ", " +
-        module->debug_identifier() + ")";
+                    PathnameStripper::File(module->debug_file()) + ", " +
+                    module->debug_identifier() + ")";
   } else if (ContainsModule(modules_with_corrupt_symbols, module)) {
     symbol_issues = "  (WARNING: Corrupt symbols, " +
-        PathnameStripper::File(module->debug_file()) + ", " +
-        module->debug_identifier() + ")";
+                    PathnameStripper::File(module->debug_file()) + ", " +
+                    module->debug_identifier() + ")";
   }
   uint64_t base_address = module->base_address();
-  printf("0x%08" PRIx64 " - 0x%08" PRIx64 "  %s  %s%s%s\n",
-         base_address, base_address + module->size() - 1,
+  printf("0x%08" PRIx64 " - 0x%08" PRIx64 "  %s  %s%s%s\n", base_address,
+         base_address + module->size() - 1,
          PathnameStripper::File(module->code_file()).c_str(),
          module->version().empty() ? "???" : module->version().c_str(),
          main_address != 0 && base_address == main_address ? "  (main)" : "",
@@ -1070,8 +1239,7 @@ static void PrintModules(
   }
 
   unsigned int module_count = modules->module_count();
-  for (unsigned int module_sequence = 0;
-       module_sequence < module_count;
+  for (unsigned int module_sequence = 0; module_sequence < module_count;
        ++module_sequence) {
     const CodeModule* module = modules->GetModuleAtSequence(module_sequence);
     PrintModule(module, modules_without_symbols, modules_with_corrupt_symbols,
@@ -1095,8 +1263,7 @@ static void PrintModulesMachineReadable(const CodeModules* modules) {
   }
 
   unsigned int module_count = modules->module_count();
-  for (unsigned int module_sequence = 0;
-       module_sequence < module_count;
+  for (unsigned int module_sequence = 0; module_sequence < module_count;
        ++module_sequence) {
     const CodeModule* module = modules->GetModuleAtSequence(module_sequence);
     uint64_t base_address = module->base_address();
@@ -1106,11 +1273,9 @@ static void PrintModulesMachineReadable(const CodeModules* modules) {
            kOutputSeparator, StripSeparator(module->version()).c_str(),
            kOutputSeparator,
            StripSeparator(PathnameStripper::File(module->debug_file())).c_str(),
-           kOutputSeparator,
-           StripSeparator(module->debug_identifier()).c_str(),
-           kOutputSeparator, base_address,
-           kOutputSeparator, base_address + module->size() - 1,
-           kOutputSeparator,
+           kOutputSeparator, StripSeparator(module->debug_identifier()).c_str(),
+           kOutputSeparator, base_address, kOutputSeparator,
+           base_address + module->size() - 1, kOutputSeparator,
            main_module != nullptr && base_address == main_address ? 1 : 0);
   }
 }
@@ -1132,8 +1297,7 @@ void PrintProcessState(const ProcessState& process_state,
     // This field is optional.
     printf("     %s\n", cpu_info.c_str());
   }
-  printf("     %d CPU%s\n",
-         process_state.system_info()->cpu_count,
+  printf("     %d CPU%s\n", process_state.system_info()->cpu_count,
          process_state.system_info()->cpu_count != 1 ? "s" : "");
   printf("\n");
 
@@ -1169,9 +1333,9 @@ void PrintProcessState(const ProcessState& process_state,
   if (process_state.time_date_stamp() != 0 &&
       process_state.process_create_time() != 0 &&
       process_state.time_date_stamp() >= process_state.process_create_time()) {
-    printf("Process uptime: %d seconds\n",
-           process_state.time_date_stamp() -
-               process_state.process_create_time());
+    printf(
+        "Process uptime: %d seconds\n",
+        process_state.time_date_stamp() - process_state.process_create_time());
   } else {
     printf("Process uptime: not available\n");
   }
@@ -1180,10 +1344,9 @@ void PrintProcessState(const ProcessState& process_state,
   int requesting_thread = process_state.requesting_thread();
   if (requesting_thread != -1) {
     printf("\n");
-    printf("Thread %d (%s)\n",
-          requesting_thread,
-          process_state.crashed() ? "crashed" :
-                                    "requested dump, did not crash");
+    printf(
+        "Thread %d (%s)\n", requesting_thread,
+        process_state.crashed() ? "crashed" : "requested dump, did not crash");
     PrintStack(process_state.threads()->at(requesting_thread), cpu,
                output_stack_contents,
                process_state.thread_memory_regions()->at(requesting_thread),
@@ -1199,15 +1362,14 @@ void PrintProcessState(const ProcessState& process_state,
         printf("\n");
         printf("Thread %d\n", thread_index);
         PrintStack(process_state.threads()->at(thread_index), cpu,
-                  output_stack_contents,
-                  process_state.thread_memory_regions()->at(thread_index),
-                  process_state.modules(), resolver);
+                   output_stack_contents,
+                   process_state.thread_memory_regions()->at(thread_index),
+                   process_state.modules(), resolver);
       }
     }
   }
 
-  PrintModules(process_state.modules(),
-               process_state.modules_without_symbols(),
+  PrintModules(process_state.modules(), process_state.modules_without_symbols(),
                process_state.modules_with_corrupt_symbols());
 }
 
@@ -1225,8 +1387,7 @@ void PrintProcessStateMachineReadable(const ProcessState& process_state) {
          kOutputSeparator,
          // this may be empty
          StripSeparator(process_state.system_info()->cpu_info).c_str(),
-         kOutputSeparator,
-         process_state.system_info()->cpu_count);
+         kOutputSeparator, process_state.system_info()->cpu_count);
   printf("GPU%c%s%c%s%c%s\n", kOutputSeparator,
          StripSeparator(process_state.system_info()->gl_version).c_str(),
          kOutputSeparator,
@@ -1248,8 +1409,8 @@ void PrintProcessStateMachineReadable(const ProcessState& process_state) {
     // instead of the unhelpful "No crash"
     std::string assertion = process_state.assertion();
     if (!assertion.empty()) {
-      printf("%s%c%c", StripSeparator(assertion).c_str(),
-             kOutputSeparator, kOutputSeparator);
+      printf("%s%c%c", StripSeparator(assertion).c_str(), kOutputSeparator,
+             kOutputSeparator);
     } else {
       printf("No crash%c%c", kOutputSeparator, kOutputSeparator);
     }
