@@ -370,7 +370,6 @@ class ElfSymbolParser {
 
     if (memcmp(ehdr_->e_ident, ELFMAG, SELFMAG) != 0 ||
         ehdr_->e_ident[EI_CLASS] != ELFCLASS64) {
-      std::cerr << "Error: Not a valid 64-bit ELF file." << std::endl;
       Cleanup();
       return false;
     }
@@ -527,7 +526,6 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
     } else {
       auto ptr = std::make_unique<ElfSymbolParser>();
       if (!ptr->Load(path)) {
-        std::cout << "Failed to load" << path << " for ElfSymbolParser\n";
         return;
       }
 
