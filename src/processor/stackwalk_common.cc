@@ -41,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <cxxabi.h>
 #include <elf.h>
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -51,7 +52,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <cxxabi.h>
+
 
 #include "common/stdio_wrapper.h"
 #include "google_breakpad/processor/call_stack.h"
@@ -322,20 +323,21 @@ static const char* GetSymbolBinding(uint8_t binding) {
 }
 
 static std::string DemangleSymbol(const char* mangled_symbol) {
-    int status = 0;
+  int status = 0;
 
-    char* demangled_name_c = abi::__cxa_demangle(mangled_symbol, nullptr, nullptr, &status);
+  char* demangled_name_c =
+      abi::__cxa_demangle(mangled_symbol, nullptr, nullptr, &status);
 
-    if (status == 0 && demangled_name_c) {
-        // Success! Use a unique_ptr with a custom deleter (std::free)
-        // to ensure the malloc'd memory is freed automatically.
-        std::unique_ptr<char, decltype(&std::free)> demangled_ptr(demangled_name_c, &std::free);
-        return std::string(demangled_ptr.get());
-    } else {
-        return std::string(mangled_symbol);
-    }
+  if (status == 0 && demangled_name_c) {
+    // Success! Use a unique_ptr with a custom deleter (std::free)
+    // to ensure the malloc'd memory is freed automatically.
+    std::unique_ptr<char, decltype(&std::free)> demangled_ptr(demangled_name_c,
+                                                              &std::free);
+    return std::string(demangled_ptr.get());
+  } else {
+    return std::string(mangled_symbol);
+  }
 }
-
 
 class ElfSymbolParser {
  public:
@@ -525,12 +527,10 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
       parser = it->second.get();
     } else {
       auto ptr = std::make_unique<ElfSymbolParser>();
-      if (!ptr->Load(path)) {
-        return;
+      if (ptr->Load(path)) {
+        g_symbolMaps[path] = std::move(ptr);
+        parser = g_symbolMaps[path].get();
       }
-
-      g_symbolMaps[path] = std::move(ptr);
-      parser = g_symbolMaps[path].get();
     }
     printf("%s", PathnameStripper::File(frame->module->code_file()).c_str());
 
@@ -556,7 +556,8 @@ static void PrintFrameHeader(const StackFrame* frame, int frame_index) {
         // The symbol's address (value.address) is also an RVA
         uint64_t offset_in_symbol = rva - value.address;
 
-        // printf(" (%s + 0x%" PRIx64 ")", DemangleSymbol(value.name.c_str()).c_str(), offset_in_symbol);
+        // printf(" (%s + 0x%" PRIx64 ")",
+        // DemangleSymbol(value.name.c_str()).c_str(), offset_in_symbol);
         printf(" (%s + 0x%" PRIx64 ")", value.name.c_str(), offset_in_symbol);
       }
     } else {
